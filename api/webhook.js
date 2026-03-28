@@ -70,20 +70,23 @@ function sendTelegram(chatId, text, botToken) {
 function claudeChat(messages, apiKey) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({
-      model: 'claude-sonnet-4-5-20251001',
+      model: 'anthropic/claude-sonnet-4-5',
       max_tokens: 2048,
-      system: SYSTEM_PROMPT,
-      messages: messages
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        ...messages
+      ]
     });
 
     const options = {
-      hostname: 'api.anthropic.com',
-      path: '/v1/messages',
+      hostname: 'openrouter.ai',
+      path: '/api/v1/chat/completions',
       method: 'POST',
       headers: {
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
+        'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://lingxia-bot.vercel.app',
+        'X-Title': 'LingXia Bot',
         'Content-Length': Buffer.byteLength(body)
       }
     };
@@ -115,7 +118,7 @@ module.exports = async (req, res) => {
   const chatId = message.chat.id;
   const text = message.text;
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.OPENROUTER_API_KEY;
 
   if (!conversations[chatId]) conversations[chatId] = [];
   conversations[chatId].push({ role: 'user', content: text });
@@ -125,7 +128,7 @@ module.exports = async (req, res) => {
 
   try {
     const result = await claudeChat(conversations[chatId], apiKey);
-    const reply = result.content[0].text;
+    const reply = result.choices[0].message.content;
     conversations[chatId].push({ role: 'assistant', content: reply });
     await sendTelegram(chatId, reply, botToken);
   } catch (e) {
