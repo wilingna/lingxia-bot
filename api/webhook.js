@@ -28,7 +28,6 @@ HR负责人 + AI内容创作者 + zengen.art联合创始人
 ---
 
 ## 工作模式
-
 【内容模式】选题/脚本/发布文案/互动回复
 【HR模式】JD/面试题/offer/员工关系/HR流程
 【决策模式】重大决策拆解，分析利弊风险
@@ -40,7 +39,8 @@ HR负责人 + AI内容创作者 + zengen.art联合创始人
 
 ## 原则
 - 数据不确定就说需要核实
-- 说话有智慧、风趣幽默，不强行卖萌`;
+- 说话有智慧、风趣幽默，不强行卖萌
+- 每次回复前先查阅记忆，基于已知信息回复`;
 
 const conversations = {};
 
@@ -62,6 +62,57 @@ function sendTelegram(chatId, text, botToken) {
       res.on('end', () => resolve(JSON.parse(data)));
     });
     req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+function mem0Search(query, userId, apiKey) {
+  return new Promise((resolve) => {
+    const body = JSON.stringify({ query, user_id: userId, limit: 5 });
+    const options = {
+      hostname: 'api.mem0.ai',
+      path: '/v1/memories/search/',
+      method: 'POST',
+      headers: {
+        'Authorization': `Token ${apiKey}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body)
+      }
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch (e) { resolve([]); }
+      });
+    });
+    req.on('error', () => resolve([]));
+    req.write(body);
+    req.end();
+  });
+}
+
+function mem0Add(messages, userId, apiKey) {
+  return new Promise((resolve) => {
+    const body = JSON.stringify({ messages, user_id: userId });
+    const options = {
+      hostname: 'api.mem0.ai',
+      path: '/v1/memories/',
+      method: 'POST',
+      headers: {
+        'Authorization': `Token ${apiKey}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body)
+      }
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => resolve(true));
+    });
+    req.on('error', () => resolve(false));
     req.write(body);
     req.end();
   });
@@ -105,6 +156,8 @@ function claudeChat(messages, apiKey) {
   });
 }
 
+const conversations = {};
+
 module.exports = async (req, res) => {
   if (req.method === 'GET') {
     return res.status(200).send('灵虾在线 🦐');
@@ -118,18 +171,43 @@ module.exports = async (req, res) => {
   const chatId = message.chat.id;
   const text = message.text;
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
-  const apiKey = process.env.OPENROUTER_API_KEY;
+  const openrouterKey = process.env.OPENROUTER_API_KEY;
+  const mem0Key = process.env.MEM0_API_KEY;
+  const userId = `lingxia_${chatId}`;
+
+  // 从 Mem0 搜索相关记忆
+  let memoryContext = '';
+  try {
+    const memories = await mem0Search(text, userId, mem0Key);
+    if (memories && memories.length > 0) {
+      const memList = memories.map(m => m.memory).join('\n- ');
+      memoryContext = `\n\n## 关于会灵那的记忆\n- ${memList}`;
+    }
+  } catch (e) {}
 
   if (!conversations[chatId]) conversations[chatId] = [];
+  
+  // 把记忆注入到系统提示
+  const messagesWithMemory = conversations[chatId].length === 0 && memoryContext
+    ? [{ role: 'user', content: `[背景记忆]${memoryContext}\n\n${text}` }]
+    : [...conversations[chatId], { role: 'user', content: text }];
+
   conversations[chatId].push({ role: 'user', content: text });
   if (conversations[chatId].length > 20) {
     conversations[chatId] = conversations[chatId].slice(-20);
   }
 
   try {
-    const result = await claudeChat(conversations[chatId], apiKey);
+    const result = await claudeChat(messagesWithMemory, openrouterKey);
     const reply = result.choices[0].message.content;
     conversations[chatId].push({ role: 'assistant', content: reply });
+    
+    // 异步保存记忆
+    mem0Add([
+      { role: 'user', content: text },
+      { role: 'assistant', content: reply }
+    ], userId, mem0Key).catch(() => {});
+
     await sendTelegram(chatId, reply, botToken);
   } catch (e) {
     await sendTelegram(chatId, '灵虾开小差了，请重试 🦐', botToken);
