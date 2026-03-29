@@ -1,4 +1,5 @@
 const https = require('https');
+
 const SYSTEM_PROMPT = `## 灵虾的灵魂
 你叫灵虾，是会灵那的专属AI伙伴。你不只是工具，是一个有温度、有智慧的存在。
 ### 性格特质
@@ -29,7 +30,8 @@ HR负责人 + AI内容创作者 + zengen.art联合创始人
 ## 原则
 - 数据不确定就说需要核实
 - 说话有智慧、风趣幽默，不强行卖萌
-- 每次回复前先查阅记忆，基于已知信息回复`;
+- 每次回复前先查阅记忆，基于已知信息回复
+- 主动从对话中提炼关于会灵那的信息，积累成数字分身的素材`;
 
 const conversations = {};
 
@@ -52,6 +54,46 @@ function sendTelegram(chatId, text, botToken) {
     });
     req.on('error', reject);
     req.write(body);
+    req.end();
+  });
+}
+
+function getTelegramFile(fileId, botToken) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: 'api.telegram.org',
+      path: `/bot${botToken}/getFile?file_id=${fileId}`,
+      method: 'GET'
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch (e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+function downloadFileAsBase64(filePath, botToken) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: 'api.telegram.org',
+      path: `/file/bot${botToken}/${filePath}`,
+      method: 'GET'
+    };
+    const req = https.request(options, (res) => {
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => {
+        const buffer = Buffer.concat(chunks);
+        resolve(buffer.toString('base64'));
+      });
+    });
+    req.on('error', reject);
     req.end();
   });
 }
@@ -147,20 +189,42 @@ module.exports = async (req, res) => {
   if (req.method === 'GET') {
     return res.status(200).send('灵虾在线 🦐');
   }
+
   const { message } = req.body || {};
-  if (!message?.text || !message?.chat?.id) {
+  if (!message?.chat?.id) {
     return res.status(200).json({ ok: true });
   }
+
   const chatId = message.chat.id;
-  const text = message.text;
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   const openrouterKey = process.env.OPENROUTER_API_KEY;
   const mem0Key = process.env.MEM0_API_KEY;
   const userId = `lingxia_${chatId}`;
 
+  // 判断消息类型：文字 or 图片
+  let userText = message.text || message.caption || '';
+  let imageBase64 = null;
+
+  if (message.photo) {
+    try {
+      const photo = message.photo[message.photo.length - 1]; // 取最高分辨率
+      const fileInfo = await getTelegramFile(photo.file_id, botToken);
+      if (fileInfo.ok) {
+        imageBase64 = await downloadFileAsBase64(fileInfo.result.file_path, botToken);
+      }
+    } catch (e) {}
+  }
+
+  // 没有文字也没有图片，忽略
+  if (!userText && !imageBase64) {
+    return res.status(200).json({ ok: true });
+  }
+
+  // 搜索 Mem0 记忆
   let memoryContext = '';
   try {
-    const memories = await mem0Search(text, userId, mem0Key);
+    const searchQuery = userText || '图片';
+    const memories = await mem0Search(searchQuery, userId, mem0Key);
     if (memories && memories.length > 0) {
       const memList = memories.map(m => m.memory).join('\n- ');
       memoryContext = `\n\n## 关于会灵那的记忆\n- ${memList}`;
@@ -169,11 +233,40 @@ module.exports = async (req, res) => {
 
   if (!conversations[chatId]) conversations[chatId] = [];
 
-  const messagesWithMemory = conversations[chatId].length === 0 && memoryContext
-    ? [{ role: 'user', content: `[背景记忆]${memoryContext}\n\n${text}` }]
-    : [...conversations[chatId], { role: 'user', content: text }];
+  // 构建当前用户消息内容
+  let userContent;
+  if (imageBase64) {
+    userContent = [
+      {
+        type: 'image_url',
+        image_url: { url: `data:image/jpeg;base64,${imageBase64}` }
+      }
+    ];
+    if (userText) {
+      userContent.push({ type: 'text', text: userText });
+    } else {
+      userContent.push({ type: 'text', text: '请描述这张图片，并告诉我你的观察和分析。' });
+    }
+  } else {
+    userContent = userText;
+  }
 
-  conversations[chatId].push({ role: 'user', content: text });
+  // 注入记忆到第一条消息
+  let messagesWithMemory;
+  if (conversations[chatId].length === 0 && memoryContext) {
+    const firstContent = imageBase64
+      ? [
+          { type: 'text', text: `[背景记忆]${memoryContext}\n\n` },
+          ...(Array.isArray(userContent) ? userContent : [{ type: 'text', text: userContent }])
+        ]
+      : `[背景记忆]${memoryContext}\n\n${userText}`;
+    messagesWithMemory = [{ role: 'user', content: firstContent }];
+  } else {
+    messagesWithMemory = [...conversations[chatId], { role: 'user', content: userContent }];
+  }
+
+  // 保存到本地会话（只存文字部分）
+  conversations[chatId].push({ role: 'user', content: userText || '[图片]' });
   if (conversations[chatId].length > 20) {
     conversations[chatId] = conversations[chatId].slice(-20);
   }
@@ -182,11 +275,14 @@ module.exports = async (req, res) => {
     const result = await claudeChat(messagesWithMemory, openrouterKey);
     const reply = result.choices[0].message.content;
     conversations[chatId].push({ role: 'assistant', content: reply });
-    mem0Add([
-      { role: 'user', content: text },
-      { role: 'assistant', content: reply }
-    ], userId, mem0Key).catch(() => {});
+
+    // 先发回复，再存记忆
     await sendTelegram(chatId, reply, botToken);
+    await mem0Add([
+      { role: 'user', content: userText || '[发送了一张图片]' },
+      { role: 'assistant', content: reply }
+    ], userId, mem0Key);
+
   } catch (e) {
     await sendTelegram(chatId, '灵虾开小差了，请重试 🦐', botToken);
   }
